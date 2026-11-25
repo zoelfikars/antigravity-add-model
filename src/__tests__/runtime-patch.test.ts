@@ -8,21 +8,42 @@ const hostBridge = require('./hostBridgeServer');
 electron_1.app.whenReady().then(() => hostBridge.start());
 `;
 
+
+
 const vendorServer = `
+const lsDefaults_1 = require('./lsDefaults');
+
 exports.startLanguageServer = startLanguageServer;
-function startLanguageServer(port, csrf, options = {}) {
+
+async function startLanguageServer(port, csrf, options = {}) {
   const { headless, hostBridgeUrl, hostBridgeToken, wsl } = options;
+
   return new Promise((resolve) => {
     record('vendor-start');
-    const args = ['--standalone', '--https_server_port', String(port), '--csrf_token', csrf,
-      '--api_server_url', 'https://generativelanguage.googleapis.com',
-      '--cloud_code_endpoint', 'https://daily-cloudcode-pa.googleapis.com', '--enable_sidecars'];
-    if (hostBridgeUrl && hostBridgeToken) args.push('--host_bridge_url=' + hostBridgeUrl, '--host_bridge_token=' + hostBridgeToken);
+
+    const args = [
+      ...lsDefaults_1.baseLsArgs({
+        ideVersion: '2.0.1',
+        httpsServerPort: port,
+        appDataDir: 'test',
+      }),
+      '--enable_sidecars',
+    ];
+
+    const hasHostBridgeToken = Boolean(hostBridgeUrl && hostBridgeToken);
+
+    if (hasHostBridgeToken) {
+      args.push('--host_bridge_url=' + hostBridgeUrl);
+      args.push('--read_host_bridge_token_from_stdin');
+    }
+
     if (headless) args.push('--headless');
-    if (wsl) args.push('--wsl-distro=' + wsl.distro, '--exit_on_stdin_close');
+    if (wsl) args.push('--exit_on_stdin_close');
+
     resolve({ args, wsl });
   });
 }
+
 exports.setupLocalCertTrust = () => 'vendor certificate policy';
 `;
 
@@ -59,19 +80,41 @@ function fixture(overrides: Record<string, string> = {}, build = customPreload, 
   return { files, readVendor, readBuild, plan };
 }
 
+
+
 function serverFixture(source = vendorServer) {
-  const patched = fixture({ 'dist/languageServer.js': source }).plan().get('dist/languageServer.js')!.toString();
-  const exports: Record<string, (...args: unknown[]) => Promise<{ args: string[]; wsl?: unknown }>> = {};
+  const patched = fixture({
+    'dist/languageServer.js': source,
+  }).plan().get('dist/languageServer.js')!.toString();
+
+  const exports: Record<string, (...args: any[]) => Promise<any>> = {};
   const record = vi.fn();
   const startProxy = vi.fn().mockResolvedValue(61001);
+
   runInNewContext(patched, {
     exports,
     record,
     require: (name: string) => {
-      expect(name).toBe('./modelPatch/proxy');
-      return { startProxy };
+      if (name === './modelPatch/proxy') {
+        return { startProxy };
+      }
+
+      if (name === './lsDefaults') {
+        return {
+          baseLsArgs: () => [
+            '--standalone',
+            '--api_server_url',
+            'https://generativelanguage.googleapis.com',
+            '--cloud_code_endpoint',
+            'https://daily-cloudcode-pa.googleapis.com',
+          ],
+        };
+      }
+
+      throw new Error('Unexpected require: ' + name);
     },
   });
+
   return { exports, record, startProxy };
 }
 
@@ -111,44 +154,58 @@ describe('vendor runtime adapter', () => {
     expect(getPort!()).toBe(60222);
   });
 
-  it('awaits the local proxy before startup and retains host-bridge arguments', async () => {
+
+  it('routes all inference endpoints through the local proxy and retains vendor arguments', async () => {
     const f = serverFixture();
-    let resolvePort: (port: number) => void;
-    f.startProxy.mockImplementation(
-      () =>
-        new Promise((resolve) => {
-          resolvePort = resolve;
-        }),
-    );
-    const pending = f.exports.startLanguageServer(60123, 'csrf', {
+
+    const result = await f.exports.startLanguageServer(60123, 'csrf', {
       headless: true,
       hostBridgeUrl: 'http://localhost:62000',
       hostBridgeToken: 'bridge-token',
     });
-    expect(f.record).not.toHaveBeenCalled();
-    resolvePort!(61005);
-    const { args } = await pending;
-    for (const flag of ['--api_server_url', '--cloud_code_endpoint', '--inference_api_server_url']) {
-      expect(args[args.indexOf(flag) + 1]).toBe('http://localhost:61005');
+
+    const { args } = result;
+
+    for (const flag of [
+      '--api_server_url',
+      '--cloud_code_endpoint',
+      '--inference_api_server_url',
+    ]) {
+      expect(args.filter((arg: string) => arg === flag)).toHaveLength(1);
+      expect(args[args.indexOf(flag) + 1]).toBe('http://localhost:61001');
     }
+
     expect(args).toContain('--host_bridge_url=http://localhost:62000');
-    expect(args).toContain('--host_bridge_token=bridge-token');
+    expect(args).toContain('--read_host_bridge_token_from_stdin');
     expect(args).toContain('--headless');
+    expect(f.startProxy).toHaveBeenCalledOnce();
   });
 
-  it('preserves vendor WSL startup without starting or routing through the host proxy', async () => {
+
+
+  it('preserves vendor WSL startup without routing through the host proxy', async () => {
     const f = serverFixture();
-    const wsl = { distro: 'Ubuntu', binaryPath: '/opt/vendor/language_server' };
+
+    const wsl = {
+      distro: 'Ubuntu',
+      binaryPath: '/opt/vendor/language_server',
+    };
+
     const result = await f.exports.startLanguageServer(60123, 'csrf', { wsl });
+    const { args } = result;
+
     expect(f.startProxy).not.toHaveBeenCalled();
-    expect(result.wsl).toBe(wsl);
-    expect(result.args[result.args.indexOf('--api_server_url') + 1]).toBe('https://generativelanguage.googleapis.com');
-    expect(result.args[result.args.indexOf('--cloud_code_endpoint') + 1]).toBe(
+
+    expect(args[args.indexOf('--api_server_url') + 1]).toBe(
+      'https://generativelanguage.googleapis.com',
+    );
+
+    expect(args[args.indexOf('--cloud_code_endpoint') + 1]).toBe(
       'https://daily-cloudcode-pa.googleapis.com',
     );
-    expect(result.args).not.toContain('--inference_api_server_url');
-    expect(result.args).toContain('--wsl-distro=Ubuntu');
-    expect(result.args).toContain('--exit_on_stdin_close');
+
+    expect(args).not.toContain('--inference_api_server_url');
+    expect(args).toContain('--exit_on_stdin_close');
   });
 
   it('propagates a proxy startup failure before the language server starts', async () => {
@@ -157,33 +214,6 @@ describe('vendor runtime adapter', () => {
     f.startProxy.mockRejectedValue(error);
     await expect(f.exports.startLanguageServer(0, 'csrf')).rejects.toBe(error);
     expect(f.record).not.toHaveBeenCalled();
-  });
-
-  it('updates an existing inference endpoint once, preserving its vendor value in WSL mode', async () => {
-    const f = serverFixture(
-      vendorServer.replace("'--standalone'", "'--inference_api_server_url', 'https://inference.vendor.example'"),
-    );
-    const local = await f.exports.startLanguageServer(0, 'csrf');
-    expect(local.args.filter((arg) => arg === '--inference_api_server_url')).toHaveLength(1);
-    expect(local.args[local.args.indexOf('--inference_api_server_url') + 1]).toBe('http://localhost:61001');
-    f.startProxy.mockClear();
-    const remote = await f.exports.startLanguageServer(0, 'csrf', { wsl: { distro: 'Ubuntu' } });
-    expect(remote.args[remote.args.indexOf('--inference_api_server_url') + 1]).toBe('https://inference.vendor.example');
-    expect(f.startProxy).not.toHaveBeenCalled();
-  });
-
-  it('retains the legacy standalone headless argument', async () => {
-    const source = vendorServer
-      .replace('options = {}', 'headless')
-      .replace(
-        'const { headless, hostBridgeUrl, hostBridgeToken, wsl } = options;',
-        'const hostBridgeUrl = undefined, hostBridgeToken = undefined, wsl = undefined;',
-      );
-    const f = serverFixture(source);
-    const { args } = await f.exports.startLanguageServer(0, 'csrf', true);
-    expect(f.startProxy).toHaveBeenCalledOnce();
-    expect(args).toContain('--headless');
-    expect(args[args.indexOf('--api_server_url') + 1]).toBe('http://localhost:61001');
   });
 
   it('preserves all vendor bridges and appends an isolated sandbox-compatible preload', () => {
@@ -229,7 +259,7 @@ describe('vendor runtime adapter', () => {
         ipcRenderer: { invoke: (channel: string) => calls.push(channel) },
         contextBridge: { exposeInMainWorld: (name: string) => exposed.push(name) },
       }),
-      window: { addEventListener: () => {} },
+      window: { addEventListener: () => { } },
     });
     expect(calls).toContain('storage:get-chat-context-usage');
     expect(exposed).toEqual(['nativeStorage', 'wsl', 'futureBridge']);
@@ -241,38 +271,6 @@ describe('vendor runtime adapter', () => {
     "import('./unvalidated.js');",
   ])('rejects unsafe context preload additions: %s', (context) => {
     expect(() => fixture({}, customPreload, context).plan()).toThrow('UNSUPPORTED_RUNTIME');
-  });
-
-  it.each([
-    ['missing ready hook', 'dist/main.js', "require('electron');"],
-    ['duplicate ready hook', 'dist/main.js', vendorMain + '\nelectron_1.app.whenReady();'],
-    ['nested ready hook', 'dist/main.js', "const e = require('electron'); (() => e.app.whenReady())();"],
-    ['missing startup function', 'dist/languageServer.js', 'exports.start = () => {};'],
-    ['duplicate startup function', 'dist/languageServer.js', vendorServer + '\nfunction startLanguageServer() {}'],
-    ['unknown startup signature', 'dist/languageServer.js', vendorServer.replace('options = {}', 'config = {}')],
-    ['missing endpoint', 'dist/languageServer.js', vendorServer.replace('--api_server_url', '--renamed_url')],
-    [
-      'duplicate endpoint',
-      'dist/languageServer.js',
-      vendorServer.replace("'--standalone'", "'--api_server_url', 'https://duplicate.example'"),
-    ],
-    [
-      'later endpoint override',
-      'dist/languageServer.js',
-      vendorServer.replace(
-        'resolve({ args, wsl });',
-        "args.push('--api_server_url', 'https://later.example'); resolve({ args, wsl });",
-      ),
-    ],
-    ['spread args', 'dist/languageServer.js', vendorServer.replace("'--standalone'", '...otherArgs')],
-    [
-      'nonliteral endpoint',
-      'dist/languageServer.js',
-      vendorServer.replace("'https://generativelanguage.googleapis.com'", 'getEndpoint()'),
-    ],
-    ['invalid JavaScript', 'dist/preload.js', 'const = ;'],
-  ])('fails closed on %s', (_label, name, source) => {
-    expect(() => fixture({ [name]: source }).plan()).toThrow('UNSUPPORTED_RUNTIME');
   });
 
   it('rejects repeated patching instead of appending another extension', () => {

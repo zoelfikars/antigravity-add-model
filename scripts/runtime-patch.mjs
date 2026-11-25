@@ -14,6 +14,17 @@ function unsupported(file, reason) {
   throw error;
 }
 
+// Struktur vendor runtime untuk versi Antigravity yang belum dikenal. Tidak ada file aplikasi yang diubah;
+// aplikasi tetap berjalan dengan perilaku vendor normal (tanpa pengalihan model kustom).
+function unrecognized(file, reason) {
+  const error = new Error(
+    `UNRECOGNIZED_RUNTIME: ${file}: ${reason}. The vendor runtime structure for this Antigravity version is not recognized. ` +
+      'Leaving application files unchanged; the app runs normally without the model patch.',
+  );
+  error.code = 'UNRECOGNIZED_RUNTIME';
+  throw error;
+}
+
 function parse(file, bytes, allowMarker = false) {
   const source = Buffer.isBuffer(bytes) ? bytes.toString('utf8') : String(bytes);
   if (!allowMarker && source.includes(MARKER)) {
@@ -138,6 +149,8 @@ function patchLanguageServer(bytes) {
     matching(tree, (node) => ts.isFunctionDeclaration(node) && node.name?.text === 'startLanguageServer'),
     'startLanguageServer function',
   );
+
+  // Tanda tangan yang dikenali: startLanguageServer(port, csrf, options)
   if (
     fn.parent !== tree ||
     !fn.body ||
@@ -145,8 +158,9 @@ function patchLanguageServer(bytes) {
     fn.parameters.length !== 3 ||
     fn.parameters.some((parameter) => !ts.isIdentifier(parameter.name))
   ) {
-    unsupported(file, 'unrecognized startLanguageServer signature');
+    unrecognized(file, 'unrecognized startLanguageServer signature');
   }
+
   const options = fn.parameters[2];
   const hasOptions =
     options.name.text === 'options' &&
@@ -154,81 +168,156 @@ function patchLanguageServer(bytes) {
     ts.isObjectLiteralExpression(options.initializer) &&
     options.initializer.properties.length === 0;
   const legacyHeadless = options.name.text === 'headless' && !options.initializer;
-  if (!hasOptions && !legacyHeadless) unsupported(file, 'expected options = {} or legacy headless parameter');
+  if (!hasOptions && !legacyHeadless) {
+    unrecognized(file, 'expected options = {} or legacy headless parameter');
+  }
+
   if (matching(tree, (node) => ts.isIdentifier(node) && node.text === LOCAL_URL).length) {
     unsupported(file, `reserved identifier ${LOCAL_URL} already exists`);
   }
-  const args = one(
-    file,
-    matching(
-      fn.body,
-      (node) => ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.name.text === 'args',
-    ),
-    'language-server args declaration',
-  );
-  if (
-    !args.initializer ||
-    !ts.isArrayLiteralExpression(args.initializer) ||
-    !ts.isVariableDeclarationList(args.parent) ||
-    !ts.isVariableStatement(args.parent.parent)
-  ) {
-    unsupported(file, 'language-server args must be a literal array in a variable statement');
-  }
-  const returned = one(file, fn.body.statements.filter(ts.isReturnStatement), 'returned startup Promise');
-  const promise = returned.expression;
-  const executor = promise && ts.isNewExpression(promise) && promise.arguments?.[0];
-  if (
-    !promise ||
-    !ts.isNewExpression(promise) ||
-    !ts.isIdentifier(promise.expression) ||
-    promise.expression.text !== 'Promise' ||
-    promise.arguments?.length !== 1 ||
-    !executor ||
-    !(ts.isArrowFunction(executor) || ts.isFunctionExpression(executor)) ||
-    args.parent.parent.parent !== executor.body
-  ) {
-    unsupported(file, 'args must be declared directly in the returned startup Promise');
-  }
-  const elements = args.initializer.elements;
-  if (elements.some(ts.isSpreadElement)) unsupported(file, 'spread arguments are not a recognized startup layout');
+
   const edits = [];
-  for (const flag of ['--api_server_url', '--cloud_code_endpoint']) {
-    const entry = one(
-      file,
-      matching(fn.body, (node) => ts.isStringLiteral(node) && node.text === flag),
-      flag,
-    );
-    if (!elements.includes(entry)) unsupported(file, `${flag} must occur in the startup args array`);
-    const value = elements[elements.indexOf(entry) + 1];
-    if (!value || !ts.isStringLiteral(value) || !value.text.startsWith('https://')) {
-      unsupported(file, `${flag} must have a literal HTTPS vendor endpoint`);
+
+  // Layout baru (Antigravity 2.35.1+): ...lsDefaults_1.baseLsArgs(...) disebarkan ke dalam args.
+  const spreads = matching(fn.body, (node) =>
+    ts.isSpreadElement(node) &&
+    ts.isCallExpression(node.expression) &&
+    ts.isPropertyAccessExpression(node.expression.expression) &&
+    node.expression.expression.expression.getText(tree) === 'lsDefaults_1' &&
+    node.expression.expression.name.text === 'baseLsArgs'
+  );
+
+  if (spreads.length === 1) {
+    const spread = spreads[0];
+    const args = spread.parent;
+    if (
+      !ts.isArrayLiteralExpression(args) ||
+      !ts.isVariableDeclaration(args.parent) ||
+      !ts.isIdentifier(args.parent.name) ||
+      args.parent.name.text !== 'args'
+    ) {
+      unrecognized(file, 'baseLsArgs() must be spread into the args array');
     }
-    edits.push({ start: value.getStart(tree), end: value.end, text: `(${LOCAL_URL} || ${value.getText(tree)})` });
-  }
-  const inference = matching(fn.body, (node) => ts.isStringLiteral(node) && node.text === '--inference_api_server_url');
-  if (inference.length) {
-    const entry = one(file, inference, '--inference_api_server_url');
-    if (!elements.includes(entry)) unsupported(file, '--inference_api_server_url must occur in the startup args array');
-    const value = elements[elements.indexOf(entry) + 1];
-    if (!value || !ts.isStringLiteral(value) || !value.text.startsWith('https://')) {
-      unsupported(file, '--inference_api_server_url must have a literal HTTPS vendor endpoint');
+
+    const returnStatements = fn.body.statements.filter(ts.isReturnStatement);
+    if (returnStatements.length !== 1) {
+      unrecognized(file, 'expected exactly one returned startup Promise');
     }
-    edits.push({ start: value.getStart(tree), end: value.end, text: `(${LOCAL_URL} || ${value.getText(tree)})` });
-  } else {
+    const returned = returnStatements[0];
+    if (
+      !returned.expression ||
+      !ts.isNewExpression(returned.expression) ||
+      !ts.isIdentifier(returned.expression.expression) ||
+      returned.expression.expression.text !== 'Promise'
+    ) {
+      unrecognized(file, 'expected returned startup Promise');
+    }
+
+    // Di runtime, ubah nilai setiap titik akhir inferensi menjadi URL proxy lokal.
     edits.push({
-      start: args.parent.parent.end,
-      text: `\n        if (${LOCAL_URL}) args.push('--inference_api_server_url', ${LOCAL_URL});`,
+      start: args.end,
+      text: `
+        if (!wsl) {
+          const proxyUrl = ${LOCAL_URL};
+          for (const flag of [
+            '--api_server_url',
+            '--cloud_code_endpoint',
+            '--inference_api_server_url',
+          ]) {
+            const index = args.indexOf(flag);
+            if (index !== -1) args[index + 1] = proxyUrl;
+          }
+          if (!args.includes('--inference_api_server_url')) {
+            args.push('--inference_api_server_url', proxyUrl);
+          }
+        }
+    `,
     });
+  } else {
+    // Layout lama: const args = ['--standalone', '--api_server_url', 'https://...', ...];
+    const argsDecl = one(
+      file,
+      matching(
+        fn.body,
+        (node) => ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.name.text === 'args',
+      ),
+      'language-server args declaration',
+    );
+    if (
+      !argsDecl.initializer ||
+      !ts.isArrayLiteralExpression(argsDecl.initializer) ||
+      !ts.isVariableDeclarationList(argsDecl.parent) ||
+      !ts.isVariableStatement(argsDecl.parent.parent)
+    ) {
+      unrecognized(file, 'language-server args must be a literal array in a variable statement');
+    }
+    const elements = argsDecl.initializer.elements;
+    if (elements.some(ts.isSpreadElement)) {
+      unrecognized(file, 'spread arguments are not a recognized startup layout');
+    }
+
+    const returned = one(file, fn.body.statements.filter(ts.isReturnStatement), 'returned startup Promise');
+    const promise = returned.expression;
+    const executor = promise && ts.isNewExpression(promise) && promise.arguments?.[0];
+    if (
+      !promise ||
+      !ts.isNewExpression(promise) ||
+      !ts.isIdentifier(promise.expression) ||
+      promise.expression.text !== 'Promise' ||
+      promise.arguments?.length !== 1 ||
+      !executor ||
+      !(ts.isArrowFunction(executor) || ts.isFunctionExpression(executor)) ||
+      argsDecl.parent.parent.parent !== executor.body
+    ) {
+      unrecognized(file, 'args must be declared directly in the returned startup Promise');
+    }
+
+    for (const flag of ['--api_server_url', '--cloud_code_endpoint']) {
+      const entry = one(
+        file,
+        matching(fn.body, (node) => ts.isStringLiteral(node) && node.text === flag),
+        flag,
+      );
+      if (!elements.includes(entry)) {
+        unrecognized(file, `${flag} must occur in the startup args array`);
+      }
+      const value = elements[elements.indexOf(entry) + 1];
+      if (!value || !ts.isStringLiteral(value) || !value.text.startsWith('https://')) {
+        unrecognized(file, `${flag} must have a literal HTTPS vendor endpoint`);
+      }
+      edits.push({ start: value.getStart(tree), end: value.end, text: `(${LOCAL_URL} || ${value.getText(tree)})` });
+    }
+
+    const inference = matching(fn.body, (node) => ts.isStringLiteral(node) && node.text === '--inference_api_server_url');
+    if (inference.length) {
+      const entry = one(file, inference, '--inference_api_server_url');
+      if (!elements.includes(entry)) {
+        unrecognized(file, '--inference_api_server_url must occur in the startup args array');
+      }
+      const value = elements[elements.indexOf(entry) + 1];
+      if (!value || !ts.isStringLiteral(value) || !value.text.startsWith('https://')) {
+        unrecognized(file, '--inference_api_server_url must have a literal HTTPS vendor endpoint');
+      }
+      edits.push({ start: value.getStart(tree), end: value.end, text: `(${LOCAL_URL} || ${value.getText(tree)})` });
+    } else {
+      edits.push({
+        start: argsDecl.parent.parent.end,
+        text: `\n        if (${LOCAL_URL}) args.push('--inference_api_server_url', ${LOCAL_URL});`,
+      });
+    }
+
+    if (!fn.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.AsyncKeyword)) {
+      edits.push({ start: fn.getStart(tree), text: 'async ' });
+    }
   }
-  if (!fn.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.AsyncKeyword)) {
-    edits.push({ start: fn.getStart(tree), text: 'async ' });
-  }
+
   edits.push({
     start: fn.body.getStart(tree) + 1,
     text:
       `\n    ${MARKER}\n    const ${LOCAL_URL} = ${hasOptions ? 'options.wsl ? undefined : ' : ''}` +
       `'http://localhost:' + await require('./modelPatch/proxy').startProxy();\n`,
   });
+
   return applyEdits(file, source, edits);
 }
 
@@ -268,15 +357,34 @@ function patchPreload(vendorBytes, augmentations) {
  * relative to dist. The caller separately copies its build into dist/modelPatch.
  */
 export function planRuntimePatch(readVendorFile, readBuildFile, userDataDir) {
+  const mainBytes = readInput(readVendorFile, 'dist/main.js');
+  const languageServerBytes = readInput(readVendorFile, 'dist/languageServer.js');
+  const preloadBytes = readInput(readVendorFile, 'dist/preload.js');
+
+  let languageServerPatched = false;
+  let patchedLanguageServer = languageServerBytes;
+  try {
+    patchedLanguageServer = patchLanguageServer(languageServerBytes);
+    languageServerPatched = true;
+  } catch (error) {
+    if (error.code !== 'UNRECOGNIZED_RUNTIME') throw error;
+    // Fallback ke normal: struktur vendor runtime untuk versi Antigravity ini tidak dikenali.
+    // Biarkan semua file aplikasi asli (tidak diubah) agar aplikasi tetap berjalan normal.
+  }
+
+  let patchedMain = mainBytes;
+  let patchedPreload = preloadBytes;
+  if (languageServerPatched) {
+    patchedMain = patchMain(mainBytes, userDataDir);
+    patchedPreload = patchPreload(
+      preloadBytes,
+      ['customPreload.js', 'contextUsagePreload.js'].map((name) => ({ name, bytes: readInput(readBuildFile, name) })),
+    );
+  }
+
   return new Map([
-    ['dist/main.js', patchMain(readInput(readVendorFile, 'dist/main.js'), userDataDir)],
-    ['dist/languageServer.js', patchLanguageServer(readInput(readVendorFile, 'dist/languageServer.js'))],
-    [
-      'dist/preload.js',
-      patchPreload(
-        readInput(readVendorFile, 'dist/preload.js'),
-        ['customPreload.js', 'contextUsagePreload.js'].map((name) => ({ name, bytes: readInput(readBuildFile, name) })),
-      ),
-    ],
+    ['dist/main.js', Buffer.from(patchedMain)],
+    ['dist/languageServer.js', Buffer.from(patchedLanguageServer)],
+    ['dist/preload.js', Buffer.from(patchedPreload)],
   ]);
 }
