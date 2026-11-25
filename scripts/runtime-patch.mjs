@@ -179,13 +179,28 @@ function patchLanguageServer(bytes) {
   const edits = [];
 
   // Layout baru (Antigravity 2.35.1+): ...lsDefaults_1.baseLsArgs(...) disebarkan ke dalam args.
-  const spreads = matching(fn.body, (node) =>
-    ts.isSpreadElement(node) &&
-    ts.isCallExpression(node.expression) &&
-    ts.isPropertyAccessExpression(node.expression.expression) &&
-    node.expression.expression.expression.getText(tree) === 'lsDefaults_1' &&
-    node.expression.expression.name.text === 'baseLsArgs'
-  );
+  // Beberapa build (termasuk 2.35.1 asli) membungkus callee dengan koma operator,
+  // contoh: ...(0, lsDefaults_1.baseLsArgs)({...}), sehingga callee adalah
+  // ParenthesizedExpression / BinaryExpression comma bukan PropertyAccessExpression langsung.
+  function unwrapCallee(callee) {
+    let current = callee;
+    while (ts.isParenthesizedExpression(current)) current = current.expression;
+    if (ts.isBinaryExpression(current) && current.operatorToken.kind === ts.SyntaxKind.CommaToken) {
+      current = current.right;
+      while (ts.isParenthesizedExpression(current)) current = current.expression;
+    }
+    return current;
+  }
+  function isBaseLsArgsSpread(node) {
+    if (!ts.isSpreadElement(node) || !ts.isCallExpression(node.expression)) return false;
+    const inner = unwrapCallee(node.expression.expression);
+    return (
+      ts.isPropertyAccessExpression(inner) &&
+      inner.expression.getText(tree) === 'lsDefaults_1' &&
+      inner.name.text === 'baseLsArgs'
+    );
+  }
+  const spreads = matching(fn.body, isBaseLsArgsSpread);
 
   if (spreads.length === 1) {
     const spread = spreads[0];
